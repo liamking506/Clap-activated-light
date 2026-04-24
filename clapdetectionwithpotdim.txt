@@ -3,6 +3,8 @@ import network
 import socket
 import time
 
+# Upload this code onto a raspberry pi pico W or another compatible device and connect it to the MAX9814 mic amp.
+# For this version with a potentiometer, you will also need to connect it to the raspberry pi pico W.
 
 # USER SETTINGS
 # Note: To find ip of kasa light bulb, you can check its MAC address inside the device info tab in the kasa app.

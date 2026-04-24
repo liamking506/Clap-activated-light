@@ -1,0 +1,260 @@
+from machine import ADC
+import network
+import socket
+import time
+
+
+# USER SETTINGS
+# Note: To find ip of kasa light bulb, you can check its MAC address inside the device info tab in the kasa app.
+# Once device MAC is found, use an ip scanner and match the MAC address to find the lightbulbs ip.
+
+SSID = "insert wifi ssid here"
+PASSWORD = "insert wifi password here"
+BULB_IP = "insert kasa light bulb ip here"
+
+# CLAP THRESHOLD
+BASE_THRESHOLD = 18000
+
+# CLAP TIMING
+WINDOW_MS = 25
+SAMPLE_US = 500
+
+CLAP_DEBOUNCE_MS = 180
+DOUBLE_CLAP_MIN_MS = 180
+DOUBLE_CLAP_MAX_MS = 700
+SUCCESS_COOLDOWN_MS = 1200
+
+# CLAP SHARPNESS CHECK
+RISE_THRESHOLD = 4000
+
+# ADAPTIVE NOISE-FLOOR
+NOISE_MARGIN = 10000
+
+# BRIGHTNESS UPDATE CONTROL
+BRIGHTNESS_STEP = 4               # minimum % change before sending
+BRIGHTNESS_UPDATE_INTERVAL_MS = 200
+
+# KASA PORT
+KASA_PORT = 9999
+
+
+# HARDWARE
+mic = ADC(26)      # MAX9814 OUT -> GP26
+pot = ADC(27)      # potentiometer middle pin -> GP27
+
+
+# WIFI
+def wifi_connect():
+    wlan = network.WLAN(network.WLAN.IF_STA)
+    wlan.active(True)
+
+    if not wlan.isconnected():
+        print("Connecting to WiFi...")
+        wlan.connect(SSID, PASSWORD)
+
+        timeout_s = 15
+        start = time.time()
+
+        while not wlan.isconnected():
+            if time.time() - start > timeout_s:
+                raise RuntimeError("WiFi connection timed out")
+            time.sleep(0.2)
+
+    print("Connected:", wlan.ifconfig())
+    return wlan
+
+
+# KASA CONTROL
+def encrypt_kasa_command(command):
+    key = 171
+    out = bytearray()
+
+    out.extend(len(command).to_bytes(4, "big"))
+
+    for ch in command.encode():
+        key ^= ch
+        out.append(key)
+
+    return bytes(out)
+
+def send_kasa_command(command):
+    payload = encrypt_kasa_command(command)
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+
+    try:
+        s.connect((BULB_IP, KASA_PORT))
+        s.send(payload)
+
+        try:
+            s.recv(1024)
+        except:
+            pass
+    finally:
+        s.close()
+
+def bulb_off():
+    send_kasa_command(
+        '{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":{"on_off":0,"transition_period":0}}}'
+    )
+
+def set_brightness(percent):
+    percent = max(1, min(100, int(percent)))
+    cmd = (
+        '{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":'
+        '{"on_off":1,"brightness":' + str(percent) + ',"transition_period":0}}}'
+    )
+    send_kasa_command(cmd)
+
+
+# BULB STATE
+bulb_state = False
+current_brightness = 50
+last_sent_brightness = -1
+last_brightness_send_time = 0
+
+def toggle_bulb():
+    global bulb_state, last_sent_brightness, last_brightness_send_time
+
+    bulb_state = not bulb_state
+
+    if bulb_state:
+        try:
+            set_brightness(current_brightness)
+            last_sent_brightness = current_brightness
+            last_brightness_send_time = time.ticks_ms()
+            print("Bulb ON at", current_brightness, "%")
+        except Exception as e:
+            print("Brightness send failed:", e)
+    else:
+        try:
+            bulb_off()
+            print("Bulb OFF")
+        except Exception as e:
+            print("Bulb off failed:", e)
+
+def maybe_update_brightness():
+    global last_sent_brightness, last_brightness_send_time
+
+    if not bulb_state:
+        return
+
+    now = time.ticks_ms()
+
+    enough_change = abs(current_brightness - last_sent_brightness) >= BRIGHTNESS_STEP
+    enough_time = time.ticks_diff(now, last_brightness_send_time) >= BRIGHTNESS_UPDATE_INTERVAL_MS
+
+    if enough_change and enough_time:
+        try:
+            set_brightness(current_brightness)
+            last_sent_brightness = current_brightness
+            last_brightness_send_time = now
+            print("Brightness updated to", current_brightness, "%")
+        except Exception as e:
+            print("Brightness update failed:", e)
+
+
+# POTENTIOMETER PROCESSING
+def read_peak_dev_and_brightness(baseline, pot_filtered):
+    # Smooth potentiometer reading
+    pot_raw = pot.read_u16()
+    pot_filtered = (7 * pot_filtered + pot_raw) // 8
+
+    # Map pot to brightness 1..100
+    brightness = 1 + (pot_filtered * 99 // 65535)
+
+    peak_dev = 0
+    start = time.ticks_ms()
+
+    while time.ticks_diff(time.ticks_ms(), start) < WINDOW_MS:
+        raw = mic.read_u16()
+
+        # Slowly track microphone baseline / DC bias
+        baseline = (31 * baseline + raw) // 32
+
+        dev = abs(raw - baseline)
+        if dev > peak_dev:
+            peak_dev = dev
+
+        time.sleep_us(SAMPLE_US)
+
+    return peak_dev, brightness, baseline, pot_filtered
+
+
+# MAIN
+wifi_connect()
+
+baseline = mic.read_u16()
+pot_filtered = pot.read_u16()
+
+first_clap_time = None
+last_clap_time = 0
+last_success_time = 0
+last_peak = 0
+noise_floor = 0
+
+print("System ready")
+
+while True:
+    peak_dev, brightness, baseline, pot_filtered = read_peak_dev_and_brightness(
+        baseline, pot_filtered
+    )
+
+    now = time.ticks_ms()
+
+    current_brightness = brightness
+    maybe_update_brightness()
+
+    # slowly track recent background noise
+    noise_floor = (15 * noise_floor + peak_dev) // 16
+
+    # measure how sharply the sound increased
+    rise = peak_dev - last_peak
+    last_peak = peak_dev
+
+    # final threshold is whichever is bigger:
+    # the base threshold or the recent noise floor + safety margin
+   
+    effective_threshold = max(BASE_THRESHOLD, noise_floor + NOISE_MARGIN)
+
+    print(
+        "peak_dev =", peak_dev,
+        "brightness =", brightness,
+        "noise_floor =", noise_floor,
+        "effective_threshold =", effective_threshold,
+        "rise =", rise
+    )
+
+    clap_detected = (
+        peak_dev > effective_threshold and
+        rise > RISE_THRESHOLD and
+        time.ticks_diff(now, last_clap_time) > CLAP_DEBOUNCE_MS and
+        time.ticks_diff(now, last_success_time) > SUCCESS_COOLDOWN_MS
+    )
+
+    if clap_detected:
+        last_clap_time = now
+
+        if first_clap_time is None:
+            first_clap_time = now
+            print("First clap")
+
+        else:
+            gap = time.ticks_diff(now, first_clap_time)
+
+            if DOUBLE_CLAP_MIN_MS <= gap <= DOUBLE_CLAP_MAX_MS:
+                print("DOUBLE CLAP DETECTED")
+                toggle_bulb()
+
+                first_clap_time = None
+                last_success_time = now
+
+            else:
+                first_clap_time = now
+                print("First clap (reset)")
+
+    # first clap gets timed out if second clap doesn't come
+    if first_clap_time is not None:
+        if time.ticks_diff(now, first_clap_time) > DOUBLE_CLAP_MAX_MS:
+            first_clap_time = None
